@@ -1,14 +1,15 @@
 /*
- * ps4-pkgsender-payload v7.17
+ * ps4-pkgsender-payload v7.18
  * Compilado con ps4-payload-sdk (gcc + libPS4)
  *
- * CAMBIOS v7.17
+ * CAMBIOS v7.18
  * - Recupera compatibilidad de API (/api/status, /api/debug, /api/get_task_progress).
  * - Endurece registro BGFT con más variantes de parámetros para evitar 0x80990002.
  * - Mantiene soporte URL larga + normalización RFC3986 + JSON unicode/UTF-8.
  */
 
 #include <ps4.h>
+#include <stdarg.h>
 
 #define URL_MAX  32768
 #define BUF_MAX  65536
@@ -93,10 +94,39 @@ static int bgft_inited  = 0;
 static int last_task    = -1;
 static int last_bgft_rr = 0;
 static int last_user_id = 0x10000000;
+static int last_reg_attempts = 0;
 static int g_jb_result  = 0;
 static int g_shutdown   = 0;
 static int g_srv_fd     = -1;
 static char g_bgft_path[256] = {0};
+static char g_fw_string[64] = "unknown";
+static uint32_t g_fw_raw = 0;
+static const char *g_log_path = "/data/pkgsender.log";
+
+static void log_line(const char *fmt, ...) {
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    FILE *f = fopen(g_log_path, "a");
+    if (!f) return;
+    fprintf(f, "%s\n", line);
+    fclose(f);
+}
+
+static void detect_firmware(void) {
+    SceFwInfo info;
+    memset(&info, 0, sizeof(info));
+    if (!sceKernelGetSystemSwVersion) return;
+    if (sceKernelGetSystemSwVersion(&info) < 0) return;
+    g_fw_raw = info.version;
+    if (info.version_string[0]) {
+        strncpy(g_fw_string, info.version_string, sizeof(g_fw_string) - 1);
+        g_fw_string[sizeof(g_fw_string) - 1] = '\0';
+    }
+}
 
 /* ── HTTP helpers ──────────────────────────────────────────────────────── */
 static const char CORS[] =
@@ -455,6 +485,7 @@ static int try_register_variant(bgft_task_param_t *p, int *task,
                                 const char *url_candidate, uint32_t ent,
                                 uint32_t uid, const char *tid,
                                 const char *content_name, uint32_t opt) {
+    last_reg_attempts++;
     p->content_url = url_candidate;
     p->entitlement_type = ent;
     p->user_id = uid;
@@ -525,6 +556,7 @@ static void do_install(int fd, const char *url_raw, const char *title, const cha
 
     int task = -1;
     int rr = -1;
+    last_reg_attempts = 0;
 
     const uint32_t opt_variants[] = {
         BGFT_TASK_OPT_REMOTE | BGFT_TASK_OPT_DISABLE_CDN,
@@ -573,6 +605,7 @@ static void do_install(int fd, const char *url_raw, const char *title, const cha
     if (rr == 0 && task >= 0) {
         fn_bgft_start(task);
         last_task = task;
+        log_line("install_ok task=%d uid=%u opt=0x%08x attempts=%d fw=%s", task, (uint32_t)p.user_id, p.option, last_reg_attempts, g_fw_string);
 
         char resp[320];
         snprintf(resp, sizeof(resp),
@@ -580,6 +613,7 @@ static void do_install(int fd, const char *url_raw, const char *title, const cha
             task, p.id ? p.id : "", p.content_url ? p.content_url : "", p.option, p.user_id);
         http_send(fd, 200, resp);
     } else {
+        log_line("install_fail rr=0x%08x uid=%u attempts=%d fw=%s url=%s", (uint32_t)rr, (uint32_t)uid_primary, last_reg_attempts, g_fw_string, check);
         char msg[320];
         snprintf(msg, sizeof(msg),
             "{\"status\":\"fail\",\"error\":\"bgft_reg 0x%08x\",\"bgft_path\":\"%s\",\"user_id\":%u,\"suggestion\":\"verifica usuario logueado en PS4, usa URL local directa y title_id/content_id valido\"}",
@@ -608,7 +642,19 @@ static void handle_client(int fd) {
 
     if (strncmp(buf, "GET /ping", 9) == 0 || strncmp(buf, "GET / ", 6) == 0) {
         http_send(fd, 200,
-            "{\"status\":\"success\",\"service\":\"ps4-pkgsender\",\"version\":\"7.17\",\"port\":12800}");
+            "{\"status\":\"success\",\"service\":\"ps4-pkgsender\",\"version\":\"7.18\",\"port\":12800}");
+        sceNetSocketClose(fd);
+        return;
+    }
+
+    if (strncmp(buf, "GET /api/fw", 11) == 0) {
+        char resp[256];
+        snprintf(resp, sizeof(resp),
+            "{\"status\":\"success\",\"firmware\":\"%s\",\"firmware_raw\":\"0x%08x\",\"log_path\":\"%s\"}",
+            g_fw_string,
+            g_fw_raw,
+            g_log_path);
+        http_send(fd, 200, resp);
         sceNetSocketClose(fd);
         return;
     }
@@ -641,22 +687,30 @@ static void handle_client(int fd) {
         snprintf(resp, sizeof(resp),
             "{"
             "\"status\":\"success\","
-            "\"version\":\"7.17\","
+            "\"version\":\"7.18\","
+            "\"firmware\":\"%s\","
+            "\"firmware_raw\":\"0x%08x\","
+            "\"log_path\":\"%s\","
             "\"jailbreak\":\"0x%08x\","
             "\"bgft_loaded\":%s,"
             "\"bgft_inited\":%s,"
             "\"bgft_ensure\":\"0x%08x\","
             "\"bgft_path\":\"%s\","
             "\"last_bgft_reg\":\"0x%08x\","
+            "\"last_reg_attempts\":%d,"
             "\"last_user_id\":%u,"
             "\"last_task_id\":%d"
             "}",
+            g_fw_string,
+            g_fw_raw,
+            g_log_path,
             (uint32_t)g_jb_result,
             bgft_loaded == 1 ? "true" : "false",
             bgft_inited == 1 ? "true" : "false",
             (uint32_t)br,
             g_bgft_path[0] ? g_bgft_path : "not found",
             (uint32_t)last_bgft_rr,
+            last_reg_attempts,
             (uint32_t)last_user_id,
             last_task);
         http_send(fd, 200, resp);
@@ -762,6 +816,7 @@ int _main(void) {
     initNetwork();
     initSysUtil();
     initModule();
+    detect_firmware();
 
     int jb = jailbreak();
     g_jb_result = jb;
@@ -771,7 +826,9 @@ int _main(void) {
         notify(notif);
     }
 
-    notify("PKGSender v7.17\nArrancando...");
+    log_line("boot fw=%s fw_raw=0x%08x jailbreak=0x%08x", g_fw_string, g_fw_raw, (uint32_t)jb);
+
+    notify("PKGSender v7.18\nArrancando...");
 
     int srv = sceNetSocket("pkgsender_srv", AF_INET, SOCK_STREAM, 0);
     if (srv < 0) {
@@ -801,7 +858,7 @@ int _main(void) {
 
     g_srv_fd = srv;
 
-    notify("PKGSender v7.17 ACTIVO\nPuerto :12800 listo\nPOST /install_url = URL plana");
+    notify("PKGSender v7.18 ACTIVO\nPuerto :12800 listo\nPOST /install_url = URL plana");
 
     while (!g_shutdown) {
         struct sockaddr_in ca;
