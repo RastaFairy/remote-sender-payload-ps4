@@ -1,39 +1,19 @@
 /*
- * ps4-pkgsender-payload v7.11
+ * ps4-pkgsender-payload v7.15
  * Compilado con ps4-payload-sdk (gcc + libPS4)
  *
- * CAMBIOS v7.11 — sceSysmoduleLoadModuleInternal como vía principal para BGFT
- * ─────────────────────────────────────────────────────────────────────
- * En lugar de hardcodear nombres de archivo (que varían por firmware),
- * bgft_find_sprx() abre cada directorio candidato con sceKernelOpen +
- * getdents() y busca cualquier entrada cuyo nombre contenga "bgft"
- * (case-insensitive) y termine en ".sprx".
- * Funciona en todos los firmwares con GoldHEN sin recompilar.
- *
- * [v7.1] jailbreak() al arranque — fix 0xffffffff por falta de privs.
- * [v7.0] url_normalize(), POST /install_url, URL_MAX=4096.
- * [v6.0] recv_http() bucle TCP, hex_byte sin strtol.
+ * CAMBIOS v7.15
+ * - Recupera compatibilidad de API (/api/status, /api/debug, /api/get_task_progress).
+ * - Endurece registro BGFT con más variantes de parámetros para evitar 0x80990002.
+ * - Mantiene soporte URL larga + normalización RFC3986 + JSON unicode/UTF-8.
  */
 
 #include <ps4.h>
 
-/* ── Constantes ─────────────────────────────────────────────────────────── */
-#define URL_MAX   8192
-#define BUF_MAX  16384
+#define URL_MAX  16384
+#define BUF_MAX  32768
 
-
-
-/* ── dynlib syscalls directas — patrón ps4-linux-payloads/lib/dl.c ────────
- *
- * Numeros de syscall PS4 (psdevwiki.com/ps4/Syscalls):
- *   dynlib_load_prx    = 594
- *   dynlib_dlsym       = 591
- *   dynlib_get_info_ex = 608
- *
- * ABI FreeBSD x86-64: rax=num, args: rdi rsi rdx r10 r8 r9
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* Estructura module_info_ex — igual que dl.c de flatz */
+/* ── dynlib syscalls ────────────────────────────────────────────────────── */
 struct ps4_module_segment {
     uint64_t addr;
     uint32_t size;
@@ -76,96 +56,26 @@ static int ps4_dynlib_load_prx(const char *path, int flags, int *handle, int zer
     return (int)ret;
 }
 
-__attribute__((unused)) static int ps4_dynlib_dlsym(int handle, const char *name, void **addr)
-{
-    register long        rax __asm__("rax") = 591;
-    register long        rdi __asm__("rdi") = (long)handle;
-    register const char *rsi __asm__("rsi") = name;
-    register void      **rdx __asm__("rdx") = addr;
-    long ret;
-    __asm__ volatile("syscall"
-        : "=a"(ret) : "r"(rax),"r"(rdi),"r"(rsi),"r"(rdx)
-        : "rcx","r11","memory");
-    return (int)ret;
-}
-
-__attribute__((unused)) static int ps4_dynlib_get_info_ex(int handle, int unk, struct ps4_module_info_ex *info)
-{
-    register long                    rax __asm__("rax") = 608;
-    register long                    rdi __asm__("rdi") = (long)handle;
-    register long                    rsi __asm__("rsi") = (long)unk;
-    register struct ps4_module_info_ex *rdx __asm__("rdx") = info;
-    long ret;
-    __asm__ volatile("syscall"
-        : "=a"(ret) : "r"(rax),"r"(rdi),"r"(rsi),"r"(rdx)
-        : "rcx","r11","memory");
-    return (int)ret;
-}
-
-/*
- * ps4_dlopen — carga un sprx via dynlib_load_prx.
- *
- * IMPORTANTE: cuando el modulo ya esta cargado por el sistema, la syscall
- * puede retornar un codigo de error != 0 pero aun asi escribir un handle
- * valido (>= 0). La unica condicion de fallo real es h < 0.
- * NO llamamos init_proc manualmente — el modulo ya fue inicializado por
- * el sistema y llamarlo de nuevo puede corromper el estado interno.
- */
-__attribute__((unused)) static int ps4_dlopen(const char *path)
-{
-    int h = -1;
-    int ret = ps4_dynlib_load_prx(path, 0, &h, 0);
-    (void)ret;  /* ignorar ret — solo importa h */
-    return h;   /* >= 0 valido, < 0 fallo */
-}
-
-
-
-/* ── BGFT ────────────────────────────────────────────────────────────────── */
-/*
- * Service API de libSceBgft.sprx:
- *   sceBgftServiceInit / sceBgftServiceIntInit  — inicializa con heap
- *   sceBgftServiceDownloadRegisterTask          — registra la descarga
- *   sceBgftServiceDownloadStartTask             — arranca la tarea
- *
- * "sceBgftServiceInit" se confirmó resolvible en iteración anterior (init=ok).
- * Se prueban múltiples candidatos para register hasta encontrar el correcto.
- */
-
-/* ── Structs BGFT — Service API (confirmado flatz / ps4libdoc) ────────────
- *
- * sceBgftServiceInit toma un puntero a bgft_init_params_t.
- * sceBgftServiceDownloadRegisterTask toma bgft_task_param_t*.
- *
- * Fuente: https://github.com/flatz/ps4_remote_pkg_installer
- * ──────────────────────────────────────────────────────────────────────── */
-
+/* ── BGFT ───────────────────────────────────────────────────────────────── */
 typedef struct {
-    size_t size; /* debe ser sizeof(bgft_init_params_t) */
-    void  *mem;  /* heap de trabajo, 1 MB */
+    size_t size;
+    void  *mem;
 } bgft_init_params_t;
 
-/* SceBgftDownloadParam — layout exacto de flatz/ps4_remote_pkg_installer
- * Fuente: installer.c (SceBgftDownloadParam + sceBgftServiceDownloadRegisterTask)
- * Offsets verificados contra OpenOrbis PS4 Toolchain headers.
- *
- * CRÍTICO: entitlement_type va en offset 0, user_id en offset 4,
- *          id (puntero) en offset 8. Cualquier reordenamiento = 0x80990002.
- */
 typedef struct {
-    uint32_t    entitlement_type;   /* offset  0 — 5 para fPKG/descarga */
-    uint32_t    user_id;            /* offset  4 — 0x10000000 = user 1  */
-    const char *id;                 /* offset  8 — content_id del PKG   */
-    const char *content_url;        /* offset 16 — URL del .pkg         */
-    const char *content_name;       /* offset 24 — nombre visible       */
-    const char *icon_path;          /* offset 32 — NULL ok              */
-    const char *sku_id;             /* offset 40 — NULL ok              */
-    const char *playgo_scenario_id; /* offset 48 — NULL ok              */
-    const char *release_date;       /* offset 56 — NULL ok              */
-    const char *package_type;       /* offset 64 — NULL ok              */
-    const char *package_sub_type;   /* offset 72 — NULL ok              */
-    uint64_t    package_size;       /* offset 80 — 0 = desconocido      */
-    uint32_t    option;             /* offset 88 — BGFT_TASK_OPT_*      */
+    uint32_t    entitlement_type;
+    uint32_t    user_id;
+    const char *id;
+    const char *content_url;
+    const char *content_name;
+    const char *icon_path;
+    const char *sku_id;
+    const char *playgo_scenario_id;
+    const char *release_date;
+    const char *package_type;
+    const char *package_sub_type;
+    uint64_t    package_size;
+    uint32_t    option;
 } bgft_task_param_t;
 
 #define BGFT_TASK_OPT_NONE        0x00000000
@@ -174,104 +84,27 @@ typedef struct {
 #define BGFT_TASK_OPT_REMOTE      0x00000010
 #define BGFT_TASK_OPT_DISABLE_CDN 0x00010000
 
-
-static int (*fn_bgft_init)(bgft_init_params_t *p)                              = NULL;
-static int (*fn_bgft_term)(void)                                               = NULL;
-static int (*fn_bgft_reg) (const bgft_task_param_t *p, int *task_id)           = NULL;
-static int (*fn_bgft_start)(int task_id)                                       = NULL;
+static int (*fn_bgft_init)(bgft_init_params_t *p)                    = NULL;
+static int (*fn_bgft_reg) (const bgft_task_param_t *p, int *task_id) = NULL;
+static int (*fn_bgft_start)(int task_id)                              = NULL;
 
 static int bgft_loaded  = 0;
 static int bgft_inited  = 0;
 static int last_task    = -1;
+static int last_bgft_rr = 0;
+static int last_user_id = 0x10000000;
 static int g_jb_result  = 0;
-static char g_bgft_path[256] = {0};
 static int g_shutdown   = 0;
 static int g_srv_fd     = -1;
+static char g_bgft_path[256] = {0};
 
-/* Heap de trabajo para sceBgftServiceInit — 1 MB */
-
-static int bgft_ensure(void) {
-    if (bgft_loaded == -1) return -1;
-    if (!bgft_loaded) {
-        int _bgft_h = -1;
-        int _bgft_ret = ps4_dynlib_load_prx(
-            "/system/common/lib/libSceBgft.sprx", 0, &_bgft_h, 0);
-        int h = _bgft_h;
-        if (h < 0) {
-            snprintf(g_bgft_path, sizeof(g_bgft_path),
-                     "dlopen_failed:ret=0x%x h=%d", _bgft_ret, _bgft_h);
-            bgft_loaded = -1; return -1;
-        }
-
-        /* Service API — nombres confirmados en PS4 homebrew (flatz, ps4libdoc) */
-        getFunctionAddressByName(h, "sceBgftServiceInit",                   &fn_bgft_init);
-        if (!fn_bgft_init)
-        getFunctionAddressByName(h, "sceBgftServiceIntInit",                &fn_bgft_init);
-        getFunctionAddressByName(h, "sceBgftServiceTerm",                   &fn_bgft_term);
-        getFunctionAddressByName(h, "sceBgftServiceDownloadStartTask",      &fn_bgft_start);
-        if (!fn_bgft_start)
-        getFunctionAddressByName(h, "sceBgftDownloadStartTask",             &fn_bgft_start);
-
-        /* Probar todos los candidatos conocidos para la función de registro */
-        getFunctionAddressByName(h, "sceBgftServiceDownloadRegisterTask",        &fn_bgft_reg);
-        if (!fn_bgft_reg)
-        getFunctionAddressByName(h, "sceBgftServiceDownloadRegisterTaskByStorageEx", &fn_bgft_reg);
-        if (!fn_bgft_reg)
-        getFunctionAddressByName(h, "sceBgftDownloadRegisterTaskByStorageEx",    &fn_bgft_reg);
-        if (!fn_bgft_reg)
-        getFunctionAddressByName(h, "sceBgftDownloadRegisterTask",               &fn_bgft_reg);
-
-        snprintf(g_bgft_path, sizeof(g_bgft_path),
-                 "dynlib:h=%d init=%s reg=%s start=%s",
-                 h,
-                 fn_bgft_init  ? "ok" : "NULL",
-                 fn_bgft_reg   ? "ok" : "NULL",
-                 fn_bgft_start ? "ok" : "NULL");
-
-        if (!fn_bgft_init || !fn_bgft_reg || !fn_bgft_start) {
-            bgft_loaded = -1; return -2;
-        }
-        bgft_loaded = 1;
-    }
-    if (bgft_inited != 1) {
-        /* Allocar el heap BGFT dinamicamente — 1 MB en BSS estatico
-         * excede los limites del linker del ps4-payload-sdk */
-        void *bgft_heap = mmap(NULL, 0x100000,
-            PROT_READ | PROT_WRITE,
-            MAP_ANONYMOUS | MAP_PRIVATE,
-            -1, 0);
-        if (!bgft_heap || bgft_heap == MAP_FAILED) {
-            snprintf(g_bgft_path, sizeof(g_bgft_path), "mmap_failed");
-            bgft_loaded = -1; return -3;
-        }
-        bgft_init_params_t p;
-        memset(&p, 0, sizeof(p));
-        p.size = 0x100000; /* tamaño del heap de trabajo, no de la struct */
-        p.mem  = bgft_heap;
-        int r = fn_bgft_init(&p);
-        /* 0x80990002/0x80990004 = ya inicializado por el sistema, se acepta */
-        if (r != 0 && (uint32_t)r != 0x80990002u && (uint32_t)r != 0x80990004u) { bgft_inited = r; return r; }
-        bgft_inited = 1;
-    }
-    return 0;
-}
-
-/* ── Notificaciones ─────────────────────────────────────────────────────── */
-static void notify(const char *msg) {
-    printf_notification("%s", msg);
-}
-static void notify_retry(const char *msg, int tries, int delay_sec) {
-    for (int i = 0; i < tries; i++) {
-        notify(msg);
-        if (i < tries - 1) sceKernelSleep(delay_sec);
-    }
-}
-
-/* ── HTTP helpers ───────────────────────────────────────────────────────── */
+/* ── HTTP helpers ──────────────────────────────────────────────────────── */
 static const char CORS[] =
     "Access-Control-Allow-Origin: *\r\n"
     "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
     "Access-Control-Allow-Headers: Content-Type\r\n";
+
+static void notify(const char *msg) { printf_notification("%s", msg); }
 
 static void http_send(int fd, int code, const char *body) {
     const char *st =
@@ -298,7 +131,6 @@ static int parse_int(const char *s) {
     return r;
 }
 
-/* ── recv_http ──────────────────────────────────────────────────────────── */
 static int recv_http(int fd, char *buf, int bufsz) {
     int total = 0;
     buf[0] = '\0';
@@ -318,11 +150,11 @@ static int recv_http(int fd, char *buf, int bufsz) {
         int body_recv = total - body_start;
         while (body_recv < clen && total < bufsz - 1) {
             int want = clen - body_recv;
-            int room  = bufsz - 1 - total;
+            int room = bufsz - 1 - total;
             if (want > room) want = room;
             n = sceNetRecv(fd, buf + total, want, 0);
             if (n <= 0) break;
-            total     += n;
+            total += n;
             body_recv += n;
         }
         buf[total] = '\0';
@@ -331,7 +163,53 @@ static int recv_http(int fd, char *buf, int bufsz) {
     return total;
 }
 
-/* ── JSON helpers ───────────────────────────────────────────────────────── */
+/* ── JSON helpers ──────────────────────────────────────────────────────── */
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+static int hex_byte(char hi, char lo) {
+    int h = hex_nibble(hi);
+    int l = hex_nibble(lo);
+    if (h < 0 || l < 0) return -1;
+    return (h << 4) | l;
+}
+
+static int utf8_write(int cp, char *out, int i, int sz) {
+    if (cp < 0 || i >= sz - 1) return i;
+    if (cp < 0x80) {
+        if (i < sz - 1) out[i++] = (char)cp;
+    } else if (cp < 0x800) {
+        if (i < sz - 2) {
+            out[i++] = (char)(0xC0 | (cp >> 6));
+            out[i++] = (char)(0x80 | (cp & 0x3F));
+        }
+    } else if (cp < 0x10000) {
+        if (i < sz - 3) {
+            out[i++] = (char)(0xE0 | (cp >> 12));
+            out[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[i++] = (char)(0x80 | (cp & 0x3F));
+        }
+    } else if (cp < 0x110000) {
+        if (i < sz - 4) {
+            out[i++] = (char)(0xF0 | (cp >> 18));
+            out[i++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            out[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[i++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    return i;
+}
+
+static int json_hex4(const char *p) {
+    int a = hex_nibble(p[0]), b = hex_nibble(p[1]), c = hex_nibble(p[2]), d = hex_nibble(p[3]);
+    if (a < 0 || b < 0 || c < 0 || d < 0) return -1;
+    return (a << 12) | (b << 8) | (c << 4) | d;
+}
+
 static int json_str(const char *js, const char *key, char *out, int sz) {
     if (!js || !key || !out || sz <= 0) return -1;
     out[0] = '\0';
@@ -346,7 +224,7 @@ static int json_str(const char *js, const char *key, char *out, int sz) {
     int i = 0;
     while (*p && i < sz - 1) {
         if (*p == '"') break;
-        if (*p == '\\' && *(p+1)) {
+        if (*p == '\\' && *(p + 1)) {
             p++;
             switch (*p) {
             case '"':  out[i++] = '"';  break;
@@ -355,22 +233,19 @@ static int json_str(const char *js, const char *key, char *out, int sz) {
             case 'n':  out[i++] = '\n'; break;
             case 'r':  out[i++] = '\r'; break;
             case 't':  out[i++] = '\t'; break;
-            case 'u':
+            case 'u': {
                 if (p[1] && p[2] && p[3] && p[4]) {
-                    int v = 0;
-                    for (int k = 1; k <= 4; k++) {
-                        char c = p[k]; v <<= 4;
-                        v |= (c>='0'&&c<='9') ? c-'0'
-                           : (c>='A'&&c<='F') ? c-'A'+10
-                           : (c>='a'&&c<='f') ? c-'a'+10 : 0;
-                    }
-                    if (v > 0 && v < 0x80) out[i++] = (char)v;
+                    int cp = json_hex4(p + 1);
+                    if (cp >= 0) i = utf8_write(cp, out, i, sz);
                     p += 4;
                 }
                 break;
+            }
             default: out[i++] = *p; break;
             }
-        } else { out[i++] = *p; }
+        } else {
+            out[i++] = *p;
+        }
         p++;
     }
     out[i] = '\0';
@@ -392,9 +267,21 @@ static int json_arr_first(const char *js, const char *key, char *out, int sz) {
     if (*p != '"') return -1;
     p++;
     int i = 0;
-    while (*p && *p != '"' && i < sz - 1) {
-        if (*p == '\\' && *(p+1) == '/') { out[i++] = '/'; p += 2; continue; }
-        if (*p == '\\' && *(p+1) == '"') { out[i++] = '"'; p += 2; continue; }
+    while (*p && i < sz - 1) {
+        if (*p == '"') break;
+        if (*p == '\\' && *(p + 1)) {
+            p++;
+            if (*p == 'u' && p[1] && p[2] && p[3] && p[4]) {
+                int cp = json_hex4(p + 1);
+                if (cp >= 0) i = utf8_write(cp, out, i, sz);
+                p += 4;
+            } else if (*p == '/') out[i++] = '/';
+            else if (*p == '"') out[i++] = '"';
+            else if (*p == '\\') out[i++] = '\\';
+            else out[i++] = *p;
+            p++;
+            continue;
+        }
         out[i++] = *p++;
     }
     out[i] = '\0';
@@ -413,24 +300,13 @@ static int json_int(const char *js, const char *key, int def) {
     return parse_int(p);
 }
 
-/* ── URL helpers ────────────────────────────────────────────────────────── */
-static int hex_byte(char hi, char lo) {
-    int h = (hi>='0'&&hi<='9') ? hi-'0'
-          : (hi>='A'&&hi<='F') ? hi-'A'+10
-          : (hi>='a'&&hi<='f') ? hi-'a'+10 : -1;
-    int l = (lo>='0'&&lo<='9') ? lo-'0'
-          : (lo>='A'&&lo<='F') ? lo-'A'+10
-          : (lo>='a'&&lo<='f') ? lo-'a'+10 : -1;
-    if (h < 0 || l < 0) return -1;
-    return (h << 4) | l;
-}
-
+/* ── URL helpers ───────────────────────────────────────────────────────── */
 static void url_decode(const char *src, char *dst, int dsz) {
     int o = 0;
     while (*src && o < dsz - 1) {
         if (*src == '%' && src[1] && src[2]) {
             int v = hex_byte(src[1], src[2]);
-            if (v > 0) { dst[o++] = (char)v; src += 3; continue; }
+            if (v >= 0) { dst[o++] = (char)v; src += 3; continue; }
         } else if (*src == '+') { dst[o++] = ' '; src++; continue; }
         dst[o++] = *src++;
     }
@@ -438,32 +314,32 @@ static void url_decode(const char *src, char *dst, int dsz) {
 }
 
 static void url_normalize(const char *src, char *dst, int dsz) {
-    /* RFC 3986 — codifica todo lo que no sea un caracter seguro para URLs.
-     * Corchetes [ ] se codifican siempre: son validos solo en el host (IPv6),
-     * nunca en el path/query. BGFT los rechaza si van sin codificar. */
     static const char hex[] = "0123456789ABCDEF";
     int o = 0;
     while (*src && o < dsz - 4) {
         unsigned char c = (unsigned char)*src;
-        /* Secuencia %XX ya codificada — pasar tal cual (normalizar mayúsculas) */
+
         if (c == '%' && src[1] && src[2]) {
             int v = hex_byte(src[1], src[2]);
             if (v >= 0) {
                 dst[o++] = '%';
-                dst[o++] = hex[(v >> 4) & 0xF];  /* normalizar a mayúsculas */
+                dst[o++] = hex[(v >> 4) & 0xF];
                 dst[o++] = hex[v & 0xF];
-                src += 3; continue;
+                src += 3;
+                continue;
             }
         }
-        /* Caracteres seguros sin codificar — RFC 3986 sección 2.3 + delimitadores
-         * de path/query. NO incluir [ ] — BGFT los rechaza en el path. */
+
         if ((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||
-            c=='-'||c=='_'||c=='.'||c=='~'||  /* unreserved */
-            c==':'||c=='/'||c=='?'||c=='#'||c=='@'||  /* delimitadores URI */
+            c=='-'||c=='_'||c=='.'||c=='~'||
+            c==':'||c=='/'||c=='?'||c=='#'||c=='@'||
             c=='!'||c=='$'||c=='&'||c=='\''||c=='('||c==')'||
-            c=='*'||c=='+'||c==','||c==';'||c=='=')  /* sub-delimitadores */
-        { dst[o++] = (char)c; src++; continue; }
-        /* Todo lo demás (incluyendo [ ] espacio etc.) — codificar */
+            c=='*'||c=='+'||c==','||c==';'||c=='=') {
+            dst[o++] = (char)c;
+            src++;
+            continue;
+        }
+
         dst[o++] = '%';
         dst[o++] = hex[(c >> 4) & 0xF];
         dst[o++] = hex[c & 0xF];
@@ -473,25 +349,132 @@ static void url_normalize(const char *src, char *dst, int dsz) {
 }
 
 static void url_prepare(const char *raw, char *out, int outsz) {
-    /* Paso 1: decodificar cualquier %XX existente para evitar doble-codificación
-     * Paso 2: re-codificar correctamente según RFC 3986 (incluyendo [ ] etc.) */
     char tmp[URL_MAX];
     url_decode(raw, tmp, sizeof(tmp));
     url_normalize(tmp, out, outsz);
 }
 
-/* ── Instalacion ────────────────────────────────────────────────────────── */
-static void do_install(int fd, const char *url_raw,
-                        const char *title, const char *name) {
-    char url[URL_MAX];
-    memset(url, 0, sizeof(url));
-    url_prepare(url_raw, url, sizeof(url));
+static void extract_filename(const char *url, char *out, int outsz) {
+    if (!url || !out || outsz <= 0) return;
+    out[0] = '\0';
+    const char *p = strrchr(url, '/');
+    p = p ? p + 1 : url;
+    int i = 0;
+    while (p[i] && p[i] != '?' && p[i] != '#' && i < outsz - 1) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = '\0';
+}
 
-    if (!url[0]) {
+static int resolve_primary_user_id(void) {
+    /* En algunos entornos GoldHEN/firmware, BGFT rechaza user_id fijo.
+     * Intentamos IDs reales del usuario logueado antes de usar fallback. */
+    int32_t uid = getUserID();
+    if (uid > 0) return uid;
+    uid = getInitialUser();
+    if (uid > 0) return uid;
+    return 0x10000000;
+}
+
+/* ── BGFT runtime ──────────────────────────────────────────────────────── */
+static int bgft_ensure(void) {
+    if (bgft_loaded == -1) return -1;
+
+    if (!bgft_loaded) {
+        int _h = -1;
+        int _ret = ps4_dynlib_load_prx("/system/common/lib/libSceBgft.sprx", 0, &_h, 0);
+        int h = _h;
+
+        if (h < 0) {
+            snprintf(g_bgft_path, sizeof(g_bgft_path), "dlopen_failed:ret=0x%x h=%d", _ret, _h);
+            bgft_loaded = -1;
+            return -1;
+        }
+
+        getFunctionAddressByName(h, "sceBgftServiceInit", &fn_bgft_init);
+        if (!fn_bgft_init)
+            getFunctionAddressByName(h, "sceBgftServiceIntInit", &fn_bgft_init);
+
+        getFunctionAddressByName(h, "sceBgftServiceDownloadStartTask", &fn_bgft_start);
+        if (!fn_bgft_start)
+            getFunctionAddressByName(h, "sceBgftDownloadStartTask", &fn_bgft_start);
+
+        getFunctionAddressByName(h, "sceBgftServiceDownloadRegisterTask", &fn_bgft_reg);
+        if (!fn_bgft_reg)
+            getFunctionAddressByName(h, "sceBgftServiceDownloadRegisterTaskByStorageEx", &fn_bgft_reg);
+        if (!fn_bgft_reg)
+            getFunctionAddressByName(h, "sceBgftDownloadRegisterTaskByStorageEx", &fn_bgft_reg);
+        if (!fn_bgft_reg)
+            getFunctionAddressByName(h, "sceBgftDownloadRegisterTask", &fn_bgft_reg);
+
+        snprintf(g_bgft_path, sizeof(g_bgft_path),
+                 "dynlib:h=%d init=%s reg=%s start=%s",
+                 h,
+                 fn_bgft_init ? "ok" : "NULL",
+                 fn_bgft_reg ? "ok" : "NULL",
+                 fn_bgft_start ? "ok" : "NULL");
+
+        if (!fn_bgft_init || !fn_bgft_reg || !fn_bgft_start) {
+            bgft_loaded = -1;
+            return -2;
+        }
+        bgft_loaded = 1;
+    }
+
+    if (bgft_inited != 1) {
+        void *bgft_heap = mmap(NULL, 0x100000, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        if (!bgft_heap || bgft_heap == MAP_FAILED) {
+            snprintf(g_bgft_path, sizeof(g_bgft_path), "mmap_failed");
+            bgft_loaded = -1;
+            return -3;
+        }
+        bgft_init_params_t p;
+        memset(&p, 0, sizeof(p));
+        p.size = 0x100000;
+        p.mem  = bgft_heap;
+        int r = fn_bgft_init(&p);
+        if (r != 0 && (uint32_t)r != 0x80990002u && (uint32_t)r != 0x80990004u) {
+            bgft_inited = r;
+            return r;
+        }
+        bgft_inited = 1;
+    }
+
+    return 0;
+}
+
+static int try_register_variant(bgft_task_param_t *p, int *task,
+                                const char *url_candidate, uint32_t ent,
+                                uint32_t uid, const char *tid, uint32_t opt) {
+    p->content_url = url_candidate;
+    p->entitlement_type = ent;
+    p->user_id = uid;
+    p->id = tid;
+    p->option = opt;
+    *task = -1;
+    return fn_bgft_reg(p, task);
+}
+
+/* ── Install ───────────────────────────────────────────────────────────── */
+static void do_install(int fd, const char *url_raw, const char *title, const char *name) {
+    char url_norm[URL_MAX];
+    char url_raw_copy[URL_MAX];
+    char auto_name[256];
+    memset(url_norm, 0, sizeof(url_norm));
+    memset(url_raw_copy, 0, sizeof(url_raw_copy));
+    memset(auto_name, 0, sizeof(auto_name));
+
+    strncpy(url_raw_copy, url_raw ? url_raw : "", sizeof(url_raw_copy) - 1);
+    url_prepare(url_raw_copy, url_norm, sizeof(url_norm));
+
+    if (!url_norm[0] && !url_raw_copy[0]) {
         http_send(fd, 400, "{\"status\":\"fail\",\"error\":\"URL vacia\"}");
         return;
     }
-    if (strncmp(url,"http://",7)!=0 && strncmp(url,"https://",8)!=0) {
+
+    const char *check = url_norm[0] ? url_norm : url_raw_copy;
+    if (strncmp(check, "http://", 7) != 0 && strncmp(check, "https://", 8) != 0) {
         http_send(fd, 400, "{\"status\":\"fail\",\"error\":\"URL invalida (sin esquema http/https)\"}");
         return;
     }
@@ -499,76 +482,87 @@ static void do_install(int fd, const char *url_raw,
     int r = bgft_ensure();
     if (r != 0) {
         char msg[256];
-        snprintf(msg, sizeof(msg),
-            "{\"status\":\"fail\",\"error\":\"BGFT no disponible (0x%08x)\"}", (uint32_t)r);
+        snprintf(msg, sizeof(msg), "{\"status\":\"fail\",\"error\":\"BGFT no disponible (0x%08x)\"}", (uint32_t)r);
         http_send(fd, 500, msg);
-        char notif[128];
-        snprintf(notif, sizeof(notif), "PKGSender ERROR\nBGFT 0x%08x", (uint32_t)r);
-        notify(notif);
         return;
     }
 
-    /* bgft_task_param_t — campos en orden exacto del struct real (flatz)
-     * entitlement_type: 0 = fPKG/homebrew, 5 = contenido PSN firmado.
-     * id: nunca NULL — la función rechaza el param si es NULL. */
     bgft_task_param_t p;
     memset(&p, 0, sizeof(p));
-    p.entitlement_type   = 0;            /* 0 = fPKG, no requiere firma PSN */
-    p.user_id            = 0x10000000;   /* user 1 */
-    p.id                 = (title && title[0]) ? title
-                           : "IV0000-PKGS00001_00-0000000000000000";
-    p.content_url        = url;
-    p.content_name       = (name && name[0]) ? name : "PKGSender Package";
-    p.icon_path          = NULL;
-    p.sku_id             = NULL;
-    p.playgo_scenario_id = NULL;
-    p.release_date       = NULL;
-    p.package_type       = NULL;
-    p.package_sub_type   = NULL;
-    p.package_size       = 0;
-    p.option             = BGFT_TASK_OPT_NONE;
+
+    extract_filename(check, auto_name, sizeof(auto_name));
+
+    p.content_name = (name && name[0]) ? name : (auto_name[0] ? auto_name : "PKGSender Package");
+    p.option = BGFT_TASK_OPT_REMOTE | BGFT_TASK_OPT_DISABLE_CDN;
+
+    static const char *tid_fallbacks[] = {
+        "IV0000-PKGS00001_00-0000000000000000",
+        "EP9000-CUSA00000_00-0000000000000000",
+        "UP9000-CUSA00000_00-0000000000000000"
+    };
+
+    const char *tid0 = (title && title[0]) ? title : tid_fallbacks[0];
+    int uid_primary = resolve_primary_user_id();
+    last_user_id = uid_primary;
 
     int task = -1;
-    int rr = fn_bgft_reg(&p, &task);
+    int rr = -1;
 
-    /* Reintento con entitlement_type=5 si falla con 0 */
-    if (rr != 0) {
-        p.entitlement_type = 5;
-        task = -1;
-        rr = fn_bgft_reg(&p, &task);
+    const uint32_t opt_variants[] = {
+        BGFT_TASK_OPT_REMOTE | BGFT_TASK_OPT_DISABLE_CDN,
+        BGFT_TASK_OPT_REMOTE,
+        BGFT_TASK_OPT_NONE
+    };
+
+    for (int oi = 0; rr != 0 && oi < 3; oi++) {
+        uint32_t opt = opt_variants[oi];
+
+        rr = try_register_variant(&p, &task, url_norm[0] ? url_norm : url_raw_copy, 0, uid_primary, tid0, opt);
+        if (rr != 0) rr = try_register_variant(&p, &task, url_raw_copy[0] ? url_raw_copy : url_norm, 0, uid_primary, tid0, opt);
+
+        if (rr != 0) rr = try_register_variant(&p, &task, url_norm[0] ? url_norm : url_raw_copy, 5, uid_primary, tid0, opt);
+        if (rr != 0) rr = try_register_variant(&p, &task, url_raw_copy[0] ? url_raw_copy : url_norm, 5, uid_primary, tid0, opt);
+
+        if (rr != 0) rr = try_register_variant(&p, &task, url_norm[0] ? url_norm : url_raw_copy, 0, 0x10000000, tid0, opt);
+        if (rr != 0) rr = try_register_variant(&p, &task, url_raw_copy[0] ? url_raw_copy : url_norm, 0, 0x10000000, tid0, opt);
+        if (rr != 0) rr = try_register_variant(&p, &task, url_norm[0] ? url_norm : url_raw_copy, 0, 1, tid0, opt);
+        if (rr != 0) rr = try_register_variant(&p, &task, url_raw_copy[0] ? url_raw_copy : url_norm, 0, 1, tid0, opt);
+
+        for (int i = 1; rr != 0 && i < 3; i++) {
+            rr = try_register_variant(&p, &task, url_norm[0] ? url_norm : url_raw_copy, 0, uid_primary, tid_fallbacks[i], opt);
+            if (rr != 0)
+                rr = try_register_variant(&p, &task, url_raw_copy[0] ? url_raw_copy : url_norm, 0, uid_primary, tid_fallbacks[i], opt);
+            if (rr != 0)
+                rr = try_register_variant(&p, &task, url_norm[0] ? url_norm : url_raw_copy, 5, uid_primary, tid_fallbacks[i], opt);
+        }
     }
-    /* Reintento con user_id=1 (algunos FW usan int directo) */
-    if (rr != 0) {
-        p.entitlement_type = 0;
-        p.user_id = 1;
-        task = -1;
-        rr = fn_bgft_reg(&p, &task);
-    }
+
+    last_bgft_rr = rr;
 
     if (rr == 0 && task >= 0) {
         fn_bgft_start(task);
         last_task = task;
-        char notif[256];
-        snprintf(notif, sizeof(notif), "PKGSender\nDescargando: %s",
-            name && name[0] ? name : title && title[0] ? title : "PKG");
-        notify(notif);
-        char resp[256];
+
+        char resp[320];
         snprintf(resp, sizeof(resp),
-            "{\"status\":\"success\",\"task_id\":%d,\"title_id\":\"%s\"}",
-            task, title && title[0] ? title : "");
+            "{\"status\":\"success\",\"task_id\":%d,\"title_id\":\"%s\",\"url\":\"%s\",\"option\":%u,\"user_id\":%u}",
+            task, p.id ? p.id : "", p.content_url ? p.content_url : "", p.option, p.user_id);
         http_send(fd, 200, resp);
     } else {
-        char msg[256];
+        char msg[320];
         snprintf(msg, sizeof(msg),
-            "{\"status\":\"fail\",\"error\":\"bgft_reg 0x%08x\"}", (uint32_t)rr);
+            "{\"status\":\"fail\",\"error\":\"bgft_reg 0x%08x\",\"bgft_path\":\"%s\",\"user_id\":%u,\"suggestion\":\"verifica usuario logueado en PS4, usa URL local directa y title_id/content_id valido\"}",
+            (uint32_t)rr,
+            g_bgft_path[0] ? g_bgft_path : "n/a",
+            (uint32_t)uid_primary);
         http_send(fd, 500, msg);
-        char notif[128];
+        char notif[160];
         snprintf(notif, sizeof(notif), "PKGSender ERROR\nbgft_reg 0x%08x", (uint32_t)rr);
         notify(notif);
     }
 }
 
-/* ── Dispatcher ─────────────────────────────────────────────────────────── */
+/* ── Dispatcher ────────────────────────────────────────────────────────── */
 static void handle_client(int fd) {
     char buf[BUF_MAX];
     memset(buf, 0, sizeof(buf));
@@ -576,17 +570,18 @@ static void handle_client(int fd) {
     if (n <= 0) { sceNetSocketClose(fd); return; }
 
     if (strncmp(buf, "OPTIONS", 7) == 0) {
-        http_send(fd, 204, ""); sceNetSocketClose(fd); return;
+        http_send(fd, 204, "");
+        sceNetSocketClose(fd);
+        return;
     }
 
     if (strncmp(buf, "GET /ping", 9) == 0 || strncmp(buf, "GET / ", 6) == 0) {
         http_send(fd, 200,
-            "{\"status\":\"success\",\"service\":\"ps4-pkgsender\","
-            "\"version\":\"7.11\",\"port\":12800}");
-        sceNetSocketClose(fd); return;
+            "{\"status\":\"success\",\"service\":\"ps4-pkgsender\",\"version\":\"7.15\",\"port\":12800}");
+        sceNetSocketClose(fd);
+        return;
     }
 
-    /* GET /shutdown — libera el puerto y termina el payload sin reiniciar */
     if (strncmp(buf, "GET /shutdown", 13) == 0) {
         http_send(fd, 200, "{\"status\":\"success\",\"message\":\"PKGSender detenido\"}");
         sceNetSocketClose(fd);
@@ -596,32 +591,33 @@ static void handle_client(int fd) {
         return;
     }
 
-    if (strncmp(buf, "GET /api/status", 15) == 0 ||
-        strncmp(buf, "GET /status",     11) == 0) {
+    if (strncmp(buf, "GET /api/status", 15) == 0 || strncmp(buf, "GET /status", 11) == 0) {
         char resp[256];
         snprintf(resp, sizeof(resp),
-            "{\"status\":\"success\",\"bgft_loaded\":%s,"
-            "\"bgft_inited\":%s,\"last_task_id\":%d}",
+            "{\"status\":\"success\",\"bgft_loaded\":%s,\"bgft_inited\":%s,\"last_task_id\":%d}",
             bgft_loaded == 1 ? "true" : "false",
             bgft_inited == 1 ? "true" : "false",
             last_task);
-        http_send(fd, 200, resp); sceNetSocketClose(fd); return;
+        http_send(fd, 200, resp);
+        sceNetSocketClose(fd);
+        return;
     }
 
-    /* GET /api/debug — muestra la ruta encontrada por getdents */
     if (strncmp(buf, "GET /api/debug", 14) == 0) {
-        if (bgft_loaded == -1) { bgft_loaded = 0; g_bgft_path[0] = 0; }
+        if (bgft_loaded == -1) { bgft_loaded = 0; g_bgft_path[0] = '\0'; }
         int br = bgft_ensure();
         char resp[512];
         snprintf(resp, sizeof(resp),
             "{"
             "\"status\":\"success\","
-            "\"version\":\"7.11\","
+            "\"version\":\"7.15\","
             "\"jailbreak\":\"0x%08x\","
             "\"bgft_loaded\":%s,"
             "\"bgft_inited\":%s,"
             "\"bgft_ensure\":\"0x%08x\","
             "\"bgft_path\":\"%s\","
+            "\"last_bgft_reg\":\"0x%08x\","
+            "\"last_user_id\":%u,"
             "\"last_task_id\":%d"
             "}",
             (uint32_t)g_jb_result,
@@ -629,54 +625,31 @@ static void handle_client(int fd) {
             bgft_inited == 1 ? "true" : "false",
             (uint32_t)br,
             g_bgft_path[0] ? g_bgft_path : "not found",
+            (uint32_t)last_bgft_rr,
+            (uint32_t)last_user_id,
             last_task);
-        http_send(fd, 200, resp); sceNetSocketClose(fd); return;
+        http_send(fd, 200, resp);
+        sceNetSocketClose(fd);
+        return;
     }
 
-    /* Extraer body */
     char *body = strstr(buf, "\r\n\r\n");
     if (body) body += 4;
-    else { body = strstr(buf, "\n\n"); if (body) body += 2; }
+    else {
+        body = strstr(buf, "\n\n");
+        if (body) body += 2;
+    }
     if (!body) body = (char *)"";
     {
         int blen = (int)strlen(body);
-        while (blen > 0 && (body[blen-1]=='\r'||body[blen-1]=='\n'||body[blen-1]==' '))
+        while (blen > 0 && (body[blen-1] == '\r' || body[blen-1] == '\n' || body[blen-1] == ' '))
             body[--blen] = '\0';
     }
 
     if (strncmp(buf, "POST /api/is_exists", 19) == 0) {
         http_send(fd, 200, "{\"status\":\"success\",\"exists\":false,\"size\":0}");
-        sceNetSocketClose(fd); return;
-    }
-
-    /* POST /install_url — body plano = URL cruda, sin JSON */
-    if (strncmp(buf, "POST /install_url", 17) == 0) {
-        if (!body || !body[0]) {
-            http_send(fd, 400,
-                "{\"status\":\"fail\",\"error\":\"Body vacio: envia la URL como texto plano\"}");
-            sceNetSocketClose(fd); return;
-        }
-        do_install(fd, body, "", "");
-        sceNetSocketClose(fd); return;
-    }
-
-    /* POST /api/install */
-    if (strncmp(buf, "POST /api/install", 17) == 0) {
-        if (!*body) {
-            http_send(fd, 400, "{\"status\":\"fail\",\"error\":\"Body vacio\"}");
-            sceNetSocketClose(fd); return;
-        }
-        char url[URL_MAX]={0}, title[64]={0}, name[256]={0};
-        if (json_arr_first(body, "packages", url, sizeof(url)) <= 0)
-            json_str(body, "url", url, sizeof(url));
-        json_str(body, "title_id", title, sizeof(title));
-        json_str(body, "name",     name,  sizeof(name));
-        if (!url[0]) {
-            http_send(fd, 400, "{\"status\":\"fail\",\"error\":\"Sin URL en packages[]\"}");
-            sceNetSocketClose(fd); return;
-        }
-        do_install(fd, url, title, name);
-        sceNetSocketClose(fd); return;
+        sceNetSocketClose(fd);
+        return;
     }
 
     if (strstr(buf, "/api/get_task_progress") != NULL) {
@@ -687,36 +660,71 @@ static void handle_client(int fd) {
             "\"length\":0,\"transferred_length\":0,"
             "\"rest_sec\":0,\"preparing_percent\":50}",
             req >= 0 ? req : last_task);
-        http_send(fd, 200, resp); sceNetSocketClose(fd); return;
+        http_send(fd, 200, resp);
+        sceNetSocketClose(fd);
+        return;
     }
 
-    /* POST /install — legacy */
+    if (strncmp(buf, "POST /install_url", 17) == 0) {
+        if (!body || !body[0]) {
+            http_send(fd, 400, "{\"status\":\"fail\",\"error\":\"Body vacio: envia la URL como texto plano\"}");
+            sceNetSocketClose(fd);
+            return;
+        }
+        do_install(fd, body, "", "");
+        sceNetSocketClose(fd);
+        return;
+    }
+
+    if (strncmp(buf, "POST /api/install", 17) == 0) {
+        if (!*body) {
+            http_send(fd, 400, "{\"status\":\"fail\",\"error\":\"Body vacio\"}");
+            sceNetSocketClose(fd);
+            return;
+        }
+        char url[URL_MAX] = {0}, title[64] = {0}, name[256] = {0};
+        if (json_arr_first(body, "packages", url, sizeof(url)) <= 0)
+            json_str(body, "url", url, sizeof(url));
+        json_str(body, "title_id", title, sizeof(title));
+        json_str(body, "name", name, sizeof(name));
+        if (!url[0]) {
+            http_send(fd, 400, "{\"status\":\"fail\",\"error\":\"Sin URL en packages[]\"}");
+            sceNetSocketClose(fd);
+            return;
+        }
+        do_install(fd, url, title, name);
+        sceNetSocketClose(fd);
+        return;
+    }
+
     if (strncmp(buf, "POST /install", 13) == 0) {
         if (!*body) {
             http_send(fd, 400, "{\"status\":\"fail\",\"error\":\"Body vacio\"}");
-            sceNetSocketClose(fd); return;
+            sceNetSocketClose(fd);
+            return;
         }
-        char url[URL_MAX]={0}, title[64]={0}, name[256]={0};
+        char url[URL_MAX] = {0}, title[64] = {0}, name[256] = {0};
         if (json_str(body, "url", url, sizeof(url)) <= 0)
             json_str(body, "pkg_url", url, sizeof(url));
         json_str(body, "title_id", title, sizeof(title));
-        json_str(body, "name",     name,  sizeof(name));
+        json_str(body, "name", name, sizeof(name));
         if (!name[0]) json_str(body, "title", name, sizeof(name));
         if (!url[0]) {
             http_send(fd, 400, "{\"status\":\"fail\",\"error\":\"Campo url requerido\"}");
-            sceNetSocketClose(fd); return;
+            sceNetSocketClose(fd);
+            return;
         }
         do_install(fd, url, title, name);
-        sceNetSocketClose(fd); return;
+        sceNetSocketClose(fd);
+        return;
     }
 
     http_send(fd, 404,
-        "{\"status\":\"fail\",\"error\":"
-        "\"POST /install_url | POST /api/install | POST /install | GET /ping\"}");
+        "{\"status\":\"fail\",\"error\":\"POST /install_url | POST /api/install | POST /install | GET /ping\"}");
     sceNetSocketClose(fd);
 }
 
-/* ── Entry point ────────────────────────────────────────────────────────── */
+/* ── Entry point ───────────────────────────────────────────────────────── */
 int _main(void) {
     initKernel();
     initLibc();
@@ -732,35 +740,37 @@ int _main(void) {
         notify(notif);
     }
 
-
-    notify("PKGSender v7.11\nArrancando...");
+    notify("PKGSender v7.15\nArrancando...");
 
     int srv = sceNetSocket("pkgsender_srv", AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) { notify("PKGSender ERROR\nsceNetSocket fallo"); return 1; }
+    if (srv < 0) {
+        notify("PKGSender ERROR\nsceNetSocket fallo");
+        return 1;
+    }
 
     int opt = 1;
     sceNetSetsockopt(srv, SCE_NET_SOL_SOCKET, SCE_NET_SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = sceNetHtons(12800);
+    addr.sin_family = AF_INET;
+    addr.sin_port = sceNetHtons(12800);
     addr.sin_addr.s_addr = IN_ADDR_ANY;
 
     if (sceNetBind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        sceNetSocketClose(srv); notify("PKGSender ERROR\nPuerto 12800 ocupado"); return 1;
+        sceNetSocketClose(srv);
+        notify("PKGSender ERROR\nPuerto 12800 ocupado");
+        return 1;
     }
     if (sceNetListen(srv, 8) < 0) {
-        sceNetSocketClose(srv); notify("PKGSender ERROR\nlisten fallo"); return 1;
+        sceNetSocketClose(srv);
+        notify("PKGSender ERROR\nlisten fallo");
+        return 1;
     }
 
     g_srv_fd = srv;
 
-    notify_retry(
-        "PKGSender v7.11 ACTIVO\n"
-        "Puerto :12800 listo\n"
-        "POST /install_url = URL plana",
-        3, 1);
+    notify("PKGSender v7.15 ACTIVO\nPuerto :12800 listo\nPOST /install_url = URL plana");
 
     while (!g_shutdown) {
         struct sockaddr_in ca;
