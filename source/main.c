@@ -1,8 +1,8 @@
 /*
- * ps4-pkgsender-payload v7.15
+ * ps4-pkgsender-payload v7.17
  * Compilado con ps4-payload-sdk (gcc + libPS4)
  *
- * CAMBIOS v7.15
+ * CAMBIOS v7.17
  * - Recupera compatibilidad de API (/api/status, /api/debug, /api/get_task_progress).
  * - Endurece registro BGFT con más variantes de parámetros para evitar 0x80990002.
  * - Mantiene soporte URL larga + normalización RFC3986 + JSON unicode/UTF-8.
@@ -10,8 +10,8 @@
 
 #include <ps4.h>
 
-#define URL_MAX  16384
-#define BUF_MAX  32768
+#define URL_MAX  32768
+#define BUF_MAX  65536
 
 /* ── dynlib syscalls ────────────────────────────────────────────────────── */
 struct ps4_module_segment {
@@ -354,6 +354,13 @@ static void url_prepare(const char *raw, char *out, int outsz) {
     url_normalize(tmp, out, outsz);
 }
 
+static void url_prepare_lossless(const char *raw, char *out, int outsz) {
+    /* Variante sin decode previo: preserva cualquier %XX ya presente y
+     * solo codifica caracteres no seguros. Útil para URLs estilo navegador
+     * donde decode+reencode puede alterar semántica en algunos backends. */
+    url_normalize(raw ? raw : "", out, outsz);
+}
+
 static void extract_filename(const char *url, char *out, int outsz) {
     if (!url || !out || outsz <= 0) return;
     out[0] = '\0';
@@ -446,11 +453,13 @@ static int bgft_ensure(void) {
 
 static int try_register_variant(bgft_task_param_t *p, int *task,
                                 const char *url_candidate, uint32_t ent,
-                                uint32_t uid, const char *tid, uint32_t opt) {
+                                uint32_t uid, const char *tid,
+                                const char *content_name, uint32_t opt) {
     p->content_url = url_candidate;
     p->entitlement_type = ent;
     p->user_id = uid;
     p->id = tid;
+    p->content_name = content_name;
     p->option = opt;
     *task = -1;
     return fn_bgft_reg(p, task);
@@ -459,21 +468,24 @@ static int try_register_variant(bgft_task_param_t *p, int *task,
 /* ── Install ───────────────────────────────────────────────────────────── */
 static void do_install(int fd, const char *url_raw, const char *title, const char *name) {
     char url_norm[URL_MAX];
+    char url_norm_lossless[URL_MAX];
     char url_raw_copy[URL_MAX];
     char auto_name[256];
     memset(url_norm, 0, sizeof(url_norm));
+    memset(url_norm_lossless, 0, sizeof(url_norm_lossless));
     memset(url_raw_copy, 0, sizeof(url_raw_copy));
     memset(auto_name, 0, sizeof(auto_name));
 
     strncpy(url_raw_copy, url_raw ? url_raw : "", sizeof(url_raw_copy) - 1);
     url_prepare(url_raw_copy, url_norm, sizeof(url_norm));
+    url_prepare_lossless(url_raw_copy, url_norm_lossless, sizeof(url_norm_lossless));
 
-    if (!url_norm[0] && !url_raw_copy[0]) {
+    if (!url_norm[0] && !url_norm_lossless[0] && !url_raw_copy[0]) {
         http_send(fd, 400, "{\"status\":\"fail\",\"error\":\"URL vacia\"}");
         return;
     }
 
-    const char *check = url_norm[0] ? url_norm : url_raw_copy;
+    const char *check = url_norm[0] ? url_norm : (url_norm_lossless[0] ? url_norm_lossless : url_raw_copy);
     if (strncmp(check, "http://", 7) != 0 && strncmp(check, "https://", 8) != 0) {
         http_send(fd, 400, "{\"status\":\"fail\",\"error\":\"URL invalida (sin esquema http/https)\"}");
         return;
@@ -492,13 +504,19 @@ static void do_install(int fd, const char *url_raw, const char *title, const cha
 
     extract_filename(check, auto_name, sizeof(auto_name));
 
-    p.content_name = (name && name[0]) ? name : (auto_name[0] ? auto_name : "PKGSender Package");
+    const char *name0 = (name && name[0]) ? name : (auto_name[0] ? auto_name : "PKGSender Package");
+    p.content_name = name0;
     p.option = BGFT_TASK_OPT_REMOTE | BGFT_TASK_OPT_DISABLE_CDN;
 
     static const char *tid_fallbacks[] = {
         "IV0000-PKGS00001_00-0000000000000000",
         "EP9000-CUSA00000_00-0000000000000000",
         "UP9000-CUSA00000_00-0000000000000000"
+    };
+
+    static const char *tid_relaxed[] = {
+        NULL,
+        ""
     };
 
     const char *tid0 = (title && title[0]) ? title : tid_fallbacks[0];
@@ -514,26 +532,39 @@ static void do_install(int fd, const char *url_raw, const char *title, const cha
         BGFT_TASK_OPT_NONE
     };
 
+    const char *url_variants[3] = {
+        url_norm[0] ? url_norm : NULL,
+        url_norm_lossless[0] ? url_norm_lossless : NULL,
+        url_raw_copy[0] ? url_raw_copy : NULL
+    };
+
     for (int oi = 0; rr != 0 && oi < 3; oi++) {
         uint32_t opt = opt_variants[oi];
 
-        rr = try_register_variant(&p, &task, url_norm[0] ? url_norm : url_raw_copy, 0, uid_primary, tid0, opt);
-        if (rr != 0) rr = try_register_variant(&p, &task, url_raw_copy[0] ? url_raw_copy : url_norm, 0, uid_primary, tid0, opt);
+        for (int ui = 0; rr != 0 && ui < 3; ui++) {
+            const char *u = url_variants[ui];
+            if (!u) continue;
 
-        if (rr != 0) rr = try_register_variant(&p, &task, url_norm[0] ? url_norm : url_raw_copy, 5, uid_primary, tid0, opt);
-        if (rr != 0) rr = try_register_variant(&p, &task, url_raw_copy[0] ? url_raw_copy : url_norm, 5, uid_primary, tid0, opt);
+            rr = try_register_variant(&p, &task, u, 0, uid_primary, tid0, name0, opt);
+            if (rr != 0) rr = try_register_variant(&p, &task, u, 5, uid_primary, tid0, name0, opt);
+            if (rr != 0) rr = try_register_variant(&p, &task, u, 0, 0x10000000, tid0, name0, opt);
+            if (rr != 0) rr = try_register_variant(&p, &task, u, 0, 1, tid0, name0, opt);
 
-        if (rr != 0) rr = try_register_variant(&p, &task, url_norm[0] ? url_norm : url_raw_copy, 0, 0x10000000, tid0, opt);
-        if (rr != 0) rr = try_register_variant(&p, &task, url_raw_copy[0] ? url_raw_copy : url_norm, 0, 0x10000000, tid0, opt);
-        if (rr != 0) rr = try_register_variant(&p, &task, url_norm[0] ? url_norm : url_raw_copy, 0, 1, tid0, opt);
-        if (rr != 0) rr = try_register_variant(&p, &task, url_raw_copy[0] ? url_raw_copy : url_norm, 0, 1, tid0, opt);
+            for (int i = 1; rr != 0 && i < 3; i++) {
+                rr = try_register_variant(&p, &task, u, 0, uid_primary, tid_fallbacks[i], name0, opt);
+                if (rr != 0)
+                    rr = try_register_variant(&p, &task, u, 5, uid_primary, tid_fallbacks[i], name0, opt);
+            }
 
-        for (int i = 1; rr != 0 && i < 3; i++) {
-            rr = try_register_variant(&p, &task, url_norm[0] ? url_norm : url_raw_copy, 0, uid_primary, tid_fallbacks[i], opt);
-            if (rr != 0)
-                rr = try_register_variant(&p, &task, url_raw_copy[0] ? url_raw_copy : url_norm, 0, uid_primary, tid_fallbacks[i], opt);
-            if (rr != 0)
-                rr = try_register_variant(&p, &task, url_norm[0] ? url_norm : url_raw_copy, 5, uid_primary, tid_fallbacks[i], opt);
+            for (int i = 0; rr != 0 && i < 2; i++) {
+                rr = try_register_variant(&p, &task, u, 0, uid_primary, tid_relaxed[i], name0, opt);
+                if (rr != 0)
+                    rr = try_register_variant(&p, &task, u, 5, uid_primary, tid_relaxed[i], name0, opt);
+                if (rr != 0)
+                    rr = try_register_variant(&p, &task, u, 0, uid_primary, tid_relaxed[i], NULL, opt);
+                if (rr != 0)
+                    rr = try_register_variant(&p, &task, u, 5, uid_primary, tid_relaxed[i], NULL, opt);
+            }
         }
     }
 
@@ -577,7 +608,7 @@ static void handle_client(int fd) {
 
     if (strncmp(buf, "GET /ping", 9) == 0 || strncmp(buf, "GET / ", 6) == 0) {
         http_send(fd, 200,
-            "{\"status\":\"success\",\"service\":\"ps4-pkgsender\",\"version\":\"7.15\",\"port\":12800}");
+            "{\"status\":\"success\",\"service\":\"ps4-pkgsender\",\"version\":\"7.17\",\"port\":12800}");
         sceNetSocketClose(fd);
         return;
     }
@@ -610,7 +641,7 @@ static void handle_client(int fd) {
         snprintf(resp, sizeof(resp),
             "{"
             "\"status\":\"success\","
-            "\"version\":\"7.15\","
+            "\"version\":\"7.17\","
             "\"jailbreak\":\"0x%08x\","
             "\"bgft_loaded\":%s,"
             "\"bgft_inited\":%s,"
@@ -740,7 +771,7 @@ int _main(void) {
         notify(notif);
     }
 
-    notify("PKGSender v7.15\nArrancando...");
+    notify("PKGSender v7.17\nArrancando...");
 
     int srv = sceNetSocket("pkgsender_srv", AF_INET, SOCK_STREAM, 0);
     if (srv < 0) {
@@ -770,7 +801,7 @@ int _main(void) {
 
     g_srv_fd = srv;
 
-    notify("PKGSender v7.15 ACTIVO\nPuerto :12800 listo\nPOST /install_url = URL plana");
+    notify("PKGSender v7.17 ACTIVO\nPuerto :12800 listo\nPOST /install_url = URL plana");
 
     while (!g_shutdown) {
         struct sockaddr_in ca;
