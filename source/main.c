@@ -1,8 +1,8 @@
 /*
- * ps4-pkgsender-payload v7.21
+ * ps4-pkgsender-payload v7.22
  * Compilado con ps4-payload-sdk (gcc + libPS4)
  *
- * CAMBIOS v7.21
+ * CAMBIOS v7.22
  * - Recupera compatibilidad de API (/api/status, /api/debug, /api/get_task_progress).
  * - Endurece registro BGFT con más variantes de parámetros para evitar 0x80990002.
  * - Mantiene soporte URL larga + normalización RFC3986 + JSON unicode/UTF-8.
@@ -85,6 +85,7 @@ typedef struct {
 #define BGFT_TASK_OPT_DISABLE_CDN 0x00010000
 
 static int (*fn_bgft_init)(bgft_init_params_t *p)                    = NULL;
+static int (*fn_bgft_term)(void)                                      = NULL;
 static int (*fn_bgft_reg) (const bgft_task_param_t *p, int *task_id) = NULL;
 static int (*fn_bgft_start)(int task_id)                              = NULL;
 
@@ -92,12 +93,14 @@ static int bgft_loaded  = 0;
 static int bgft_inited  = 0;
 static int last_task    = -1;
 static int last_bgft_rr = 0;
+static int last_bgft_init_rr = 0;
 static int last_user_id = 0x10000000;
 static int last_reg_attempts = 0;
 static int g_jb_result  = 0;
 static int g_shutdown   = 0;
 static int g_srv_fd     = -1;
 static char g_bgft_path[256] = {0};
+static char g_bgft_init_trace[256] = {0};
 static char g_fw_string[64] = "unknown";
 static uint32_t g_fw_raw = 0;
 static const char *g_log_path = "/data/pkgsender.log";
@@ -434,6 +437,8 @@ static int bgft_ensure(void) {
         if (!fn_bgft_start)
             getFunctionAddressByName(h, "sceBgftDownloadStartTask", &fn_bgft_start);
 
+        getFunctionAddressByName(h, "sceBgftServiceTerm", &fn_bgft_term);
+
         getFunctionAddressByName(h, "sceBgftServiceDownloadRegisterTask", &fn_bgft_reg);
         if (!fn_bgft_reg)
             getFunctionAddressByName(h, "sceBgftServiceDownloadRegisterTaskByStorageEx", &fn_bgft_reg);
@@ -443,9 +448,10 @@ static int bgft_ensure(void) {
             getFunctionAddressByName(h, "sceBgftDownloadRegisterTask", &fn_bgft_reg);
 
         snprintf(g_bgft_path, sizeof(g_bgft_path),
-                 "dynlib:h=%d init=%s reg=%s start=%s",
+                 "dynlib:h=%d init=%s term=%s reg=%s start=%s",
                  h,
                  fn_bgft_init ? "ok" : "NULL",
+                 fn_bgft_term ? "ok" : "NULL",
                  fn_bgft_reg ? "ok" : "NULL",
                  fn_bgft_start ? "ok" : "NULL");
 
@@ -467,38 +473,78 @@ static int bgft_ensure(void) {
         int r = -1;
         bgft_init_params_t p;
         memset(&p, 0, sizeof(p));
+        g_bgft_init_trace[0] = '\0';
 
-        /* Compat firmware/SDK:
-         * Algunos entornos esperan size=sizeof(struct), otros size=heap_size.
-         * Probamos ambos layouts antes de fallar. */
+#define BGFT_INIT_OK(x) ((x) == 0 || (uint32_t)(x) == 0x80990002u || (uint32_t)(x) == 0x80990004u)
+#define BGFT_APPEND_TRACE(tag, val) \
+        do { \
+            char _t[64]; \
+            snprintf(_t, sizeof(_t), "%s:0x%08x;", (tag), (uint32_t)(val)); \
+            strncat(g_bgft_init_trace, _t, sizeof(g_bgft_init_trace) - strlen(g_bgft_init_trace) - 1); \
+        } while (0)
+
         p.size = sizeof(bgft_init_params_t);
         p.mem  = bgft_heap;
         r = fn_bgft_init(&p);
+        BGFT_APPEND_TRACE("sz_struct+heap", r);
 
-        if (r != 0 && (uint32_t)r != 0x80990002u && (uint32_t)r != 0x80990004u) {
+        if (!BGFT_INIT_OK(r)) {
             p.size = 0x100000;
             p.mem  = bgft_heap;
             r = fn_bgft_init(&p);
+            BGFT_APPEND_TRACE("sz_heap+heap", r);
         }
 
-        if (r != 0 && (uint32_t)r != 0x80990002u && (uint32_t)r != 0x80990004u) {
-            /* Último fallback: algunos payloads inicializan con mem=NULL */
+        if (!BGFT_INIT_OK(r)) {
             p.size = sizeof(bgft_init_params_t);
             p.mem  = NULL;
             r = fn_bgft_init(&p);
+            BGFT_APPEND_TRACE("sz_struct+null", r);
         }
 
+        if (!BGFT_INIT_OK(r) && fn_bgft_term) {
+            int tr = fn_bgft_term();
+            BGFT_APPEND_TRACE("term", tr);
+            p.size = sizeof(bgft_init_params_t);
+            p.mem  = bgft_heap;
+            r = fn_bgft_init(&p);
+            BGFT_APPEND_TRACE("term+sz_struct+heap", r);
+        }
+
+        if (!BGFT_INIT_OK(r) && fn_bgft_term) {
+            int tr = fn_bgft_term();
+            BGFT_APPEND_TRACE("term", tr);
+            p.size = 0x100000;
+            p.mem  = bgft_heap;
+            r = fn_bgft_init(&p);
+            BGFT_APPEND_TRACE("term+sz_heap+heap", r);
+        }
+
+        if (!BGFT_INIT_OK(r) && fn_bgft_term) {
+            int tr = fn_bgft_term();
+            BGFT_APPEND_TRACE("term", tr);
+            p.size = sizeof(bgft_init_params_t);
+            p.mem  = NULL;
+            r = fn_bgft_init(&p);
+            BGFT_APPEND_TRACE("term+sz_struct+null", r);
+        }
+
+        last_bgft_init_rr = r;
+
+#undef BGFT_APPEND_TRACE
+#undef BGFT_INIT_OK
+
         if (r != 0 && (uint32_t)r != 0x80990002u && (uint32_t)r != 0x80990004u) {
-            char l[256];
-            snprintf(l, sizeof(l), "bgft_init_fail r=0x%08x fw=%s", (uint32_t)r, g_fw_string);
+            char l[384];
+            snprintf(l, sizeof(l), "bgft_init_fail r=0x%08x fw=%s trace=%s", (uint32_t)r, g_fw_string, g_bgft_init_trace);
             log_line(l);
             bgft_inited = r;
             return r;
         }
         bgft_inited = 1;
         {
-            char l[256];
-            snprintf(l, sizeof(l), "bgft_init_ok fw=%s", g_fw_string);
+            char l[384];
+            snprintf(l, sizeof(l), "bgft_init_ok fw=%s trace=%s", g_fw_string, g_bgft_init_trace);
             log_line(l);
         }
     }
@@ -675,7 +721,7 @@ static void handle_client(int fd) {
 
     if (strncmp(buf, "GET /ping", 9) == 0 || strncmp(buf, "GET / ", 6) == 0) {
         http_send(fd, 200,
-            "{\"status\":\"success\",\"service\":\"ps4-pkgsender\",\"version\":\"7.21\",\"port\":12800}");
+            "{\"status\":\"success\",\"service\":\"ps4-pkgsender\",\"version\":\"7.22\",\"port\":12800}");
         sceNetSocketClose(fd);
         return;
     }
@@ -716,11 +762,11 @@ static void handle_client(int fd) {
     if (strncmp(buf, "GET /api/debug", 14) == 0) {
         if (bgft_loaded == -1) { bgft_loaded = 0; g_bgft_path[0] = '\0'; }
         int br = bgft_ensure();
-        char resp[512];
+        char resp[1024];
         snprintf(resp, sizeof(resp),
             "{"
             "\"status\":\"success\","
-            "\"version\":\"7.21\","
+            "\"version\":\"7.22\","
             "\"firmware\":\"%s\","
             "\"firmware_raw\":\"0x%08x\","
             "\"log_path\":\"%s\","
@@ -729,6 +775,8 @@ static void handle_client(int fd) {
             "\"bgft_inited\":%s,"
             "\"bgft_ensure\":\"0x%08x\","
             "\"bgft_path\":\"%s\","
+            "\"bgft_init_trace\":\"%s\","
+            "\"last_bgft_init\":\"0x%08x\","
             "\"last_bgft_reg\":\"0x%08x\","
             "\"last_reg_attempts\":%d,"
             "\"last_user_id\":%u,"
@@ -742,6 +790,8 @@ static void handle_client(int fd) {
             bgft_inited == 1 ? "true" : "false",
             (uint32_t)br,
             g_bgft_path[0] ? g_bgft_path : "not found",
+            g_bgft_init_trace[0] ? g_bgft_init_trace : "",
+            (uint32_t)last_bgft_init_rr,
             (uint32_t)last_bgft_rr,
             last_reg_attempts,
             (uint32_t)last_user_id,
@@ -865,7 +915,7 @@ int _main(void) {
         log_line(l);
     }
 
-    notify("PKGSender v7.21\nArrancando...");
+    notify("PKGSender v7.22\nArrancando...");
 
     int srv = sceNetSocket("pkgsender_srv", AF_INET, SOCK_STREAM, 0);
     if (srv < 0) {
@@ -895,7 +945,7 @@ int _main(void) {
 
     g_srv_fd = srv;
 
-    notify("PKGSender v7.21 ACTIVO\nPuerto :12800 listo\nPOST /install_url = URL plana");
+    notify("PKGSender v7.22 ACTIVO\nPuerto :12800 listo\nPOST /install_url = URL plana");
 
     while (!g_shutdown) {
         struct sockaddr_in ca;
