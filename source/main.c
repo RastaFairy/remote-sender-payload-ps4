@@ -1,15 +1,14 @@
 /*
- * ps4-pkgsender-payload v7.18
+ * ps4-pkgsender-payload v7.21
  * Compilado con ps4-payload-sdk (gcc + libPS4)
  *
- * CAMBIOS v7.18
+ * CAMBIOS v7.21
  * - Recupera compatibilidad de API (/api/status, /api/debug, /api/get_task_progress).
  * - Endurece registro BGFT con más variantes de parámetros para evitar 0x80990002.
  * - Mantiene soporte URL larga + normalización RFC3986 + JSON unicode/UTF-8.
  */
 
 #include <ps4.h>
-#include <stdarg.h>
 
 #define URL_MAX  32768
 #define BUF_MAX  65536
@@ -103,16 +102,14 @@ static char g_fw_string[64] = "unknown";
 static uint32_t g_fw_raw = 0;
 static const char *g_log_path = "/data/pkgsender.log";
 
-static void log_line(const char *fmt, ...) {
-    char line[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(line, sizeof(line), fmt, ap);
-    va_end(ap);
-
+static void log_line(const char *line) {
+    /* Compatibilidad SDK:
+     * - En SDK oficial moderno existe vsnprintf, pero en entornos homebrew/
+     *   ps4-payload-sdk puede faltar símbolo en link dependiendo de libc.
+     * - Evitamos varargs aquí para compilar de forma consistente en ambos. */
     FILE *f = fopen(g_log_path, "a");
     if (!f) return;
-    fprintf(f, "%s\n", line);
+    fprintf(f, "%s\n", line ? line : "");
     fclose(f);
 }
 
@@ -466,16 +463,44 @@ static int bgft_ensure(void) {
             bgft_loaded = -1;
             return -3;
         }
+
+        int r = -1;
         bgft_init_params_t p;
         memset(&p, 0, sizeof(p));
-        p.size = 0x100000;
+
+        /* Compat firmware/SDK:
+         * Algunos entornos esperan size=sizeof(struct), otros size=heap_size.
+         * Probamos ambos layouts antes de fallar. */
+        p.size = sizeof(bgft_init_params_t);
         p.mem  = bgft_heap;
-        int r = fn_bgft_init(&p);
+        r = fn_bgft_init(&p);
+
         if (r != 0 && (uint32_t)r != 0x80990002u && (uint32_t)r != 0x80990004u) {
+            p.size = 0x100000;
+            p.mem  = bgft_heap;
+            r = fn_bgft_init(&p);
+        }
+
+        if (r != 0 && (uint32_t)r != 0x80990002u && (uint32_t)r != 0x80990004u) {
+            /* Último fallback: algunos payloads inicializan con mem=NULL */
+            p.size = sizeof(bgft_init_params_t);
+            p.mem  = NULL;
+            r = fn_bgft_init(&p);
+        }
+
+        if (r != 0 && (uint32_t)r != 0x80990002u && (uint32_t)r != 0x80990004u) {
+            char l[256];
+            snprintf(l, sizeof(l), "bgft_init_fail r=0x%08x fw=%s", (uint32_t)r, g_fw_string);
+            log_line(l);
             bgft_inited = r;
             return r;
         }
         bgft_inited = 1;
+        {
+            char l[256];
+            snprintf(l, sizeof(l), "bgft_init_ok fw=%s", g_fw_string);
+            log_line(l);
+        }
     }
 
     return 0;
@@ -605,7 +630,11 @@ static void do_install(int fd, const char *url_raw, const char *title, const cha
     if (rr == 0 && task >= 0) {
         fn_bgft_start(task);
         last_task = task;
-        log_line("install_ok task=%d uid=%u opt=0x%08x attempts=%d fw=%s", task, (uint32_t)p.user_id, p.option, last_reg_attempts, g_fw_string);
+                {
+            char l[512];
+            snprintf(l, sizeof(l), "install_ok task=%d uid=%u opt=0x%08x attempts=%d fw=%s", task, (uint32_t)p.user_id, p.option, last_reg_attempts, g_fw_string);
+            log_line(l);
+        }
 
         char resp[320];
         snprintf(resp, sizeof(resp),
@@ -613,7 +642,11 @@ static void do_install(int fd, const char *url_raw, const char *title, const cha
             task, p.id ? p.id : "", p.content_url ? p.content_url : "", p.option, p.user_id);
         http_send(fd, 200, resp);
     } else {
-        log_line("install_fail rr=0x%08x uid=%u attempts=%d fw=%s url=%s", (uint32_t)rr, (uint32_t)uid_primary, last_reg_attempts, g_fw_string, check);
+                {
+            char l[512];
+            snprintf(l, sizeof(l), "install_fail rr=0x%08x uid=%u attempts=%d fw=%s url=%s", (uint32_t)rr, (uint32_t)uid_primary, last_reg_attempts, g_fw_string, check ? check : "");
+            log_line(l);
+        }
         char msg[320];
         snprintf(msg, sizeof(msg),
             "{\"status\":\"fail\",\"error\":\"bgft_reg 0x%08x\",\"bgft_path\":\"%s\",\"user_id\":%u,\"suggestion\":\"verifica usuario logueado en PS4, usa URL local directa y title_id/content_id valido\"}",
@@ -642,7 +675,7 @@ static void handle_client(int fd) {
 
     if (strncmp(buf, "GET /ping", 9) == 0 || strncmp(buf, "GET / ", 6) == 0) {
         http_send(fd, 200,
-            "{\"status\":\"success\",\"service\":\"ps4-pkgsender\",\"version\":\"7.18\",\"port\":12800}");
+            "{\"status\":\"success\",\"service\":\"ps4-pkgsender\",\"version\":\"7.21\",\"port\":12800}");
         sceNetSocketClose(fd);
         return;
     }
@@ -687,7 +720,7 @@ static void handle_client(int fd) {
         snprintf(resp, sizeof(resp),
             "{"
             "\"status\":\"success\","
-            "\"version\":\"7.18\","
+            "\"version\":\"7.21\","
             "\"firmware\":\"%s\","
             "\"firmware_raw\":\"0x%08x\","
             "\"log_path\":\"%s\","
@@ -826,9 +859,13 @@ int _main(void) {
         notify(notif);
     }
 
-    log_line("boot fw=%s fw_raw=0x%08x jailbreak=0x%08x", g_fw_string, g_fw_raw, (uint32_t)jb);
+        {
+        char l[256];
+        snprintf(l, sizeof(l), "boot fw=%s fw_raw=0x%08x jailbreak=0x%08x", g_fw_string, g_fw_raw, (uint32_t)jb);
+        log_line(l);
+    }
 
-    notify("PKGSender v7.18\nArrancando...");
+    notify("PKGSender v7.21\nArrancando...");
 
     int srv = sceNetSocket("pkgsender_srv", AF_INET, SOCK_STREAM, 0);
     if (srv < 0) {
@@ -858,7 +895,7 @@ int _main(void) {
 
     g_srv_fd = srv;
 
-    notify("PKGSender v7.18 ACTIVO\nPuerto :12800 listo\nPOST /install_url = URL plana");
+    notify("PKGSender v7.21 ACTIVO\nPuerto :12800 listo\nPOST /install_url = URL plana");
 
     while (!g_shutdown) {
         struct sockaddr_in ca;
